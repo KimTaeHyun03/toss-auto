@@ -24,15 +24,22 @@ from toss_client import TossClient, TossError
 
 KST = ZoneInfo("Asia/Seoul")
 LOG_DIR = Path(__file__).parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+
+# 콘솔 로그는 항상, 파일 로그는 가능할 때만. (배포 환경 권한/마운트 문제로 파일 생성이
+# 실패해도 프로세스가 죽지 않도록 — 어차피 중요한 기록은 DB/CSV 로 남는다.)
+_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    LOG_DIR.mkdir(exist_ok=True)
+    _handlers.append(
+        logging.FileHandler(LOG_DIR / f"trader_{datetime.now(KST):%Y%m%d}.log", encoding="utf-8")
+    )
+except OSError as e:  # 권한 등 — 콘솔 로그로 계속
+    logging.getLogger("trader").warning("파일 로그 비활성(%s) — 콘솔만 사용", e)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_DIR / f"trader_{datetime.now(KST):%Y%m%d}.log", encoding="utf-8"),
-    ],
+    handlers=_handlers,
 )
 log = logging.getLogger("trader")
 
