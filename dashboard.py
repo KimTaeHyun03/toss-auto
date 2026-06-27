@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, abort
 
 from config import Config
 from toss_client import TossClient, TossError
@@ -197,6 +197,26 @@ def _gather() -> dict:
     return out
 
 
+@app.before_request
+def _auth():
+    """DASHBOARD_TOKEN 이 설정돼 있으면 토큰 인증을 강제한다(외부 공개 배포 보호).
+    최초 접속은 ?token=... 로, 이후엔 쿠키로 통과. 미설정 시 인증 없음(로컬)."""
+    token = os.getenv("DASHBOARD_TOKEN")
+    if not token:
+        return
+    if request.cookies.get("dash_token") == token or request.args.get("token") == token:
+        return
+    abort(401)
+
+
+@app.after_request
+def _set_cookie(resp):
+    token = os.getenv("DASHBOARD_TOKEN")
+    if token and request.args.get("token") == token:
+        resp.set_cookie("dash_token", token, httponly=True, samesite="Lax", max_age=86400 * 30)
+    return resp
+
+
 @app.route("/api/state")
 def api_state():
     now = time.time()
@@ -373,7 +393,7 @@ tick(); setInterval(tick, REFRESH*1000);
 
 
 if __name__ == "__main__":
-    host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
-    port = int(os.getenv("DASHBOARD_PORT", "8787"))
+    host = os.getenv("DASHBOARD_HOST", "127.0.0.1")  # 배포 시 start.sh 가 0.0.0.0 으로 덮어씀
+    port = int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "8787"))  # Cloudtype 는 PORT 주입
     log.info("대시보드 시작: http://%s:%d  (DRY_RUN=%s, 캐시=%ss)", host, port, cfg.dry_run, _CACHE_TTL)
     app.run(host=host, port=port, debug=False)
