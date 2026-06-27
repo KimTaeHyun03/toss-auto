@@ -135,25 +135,36 @@ def _gather() -> dict:
     try:
         _ensure_account()
         holdings = toss.holdings()
-        bp = toss.buying_power()
+        # 계좌는 다통화(KRW+USD). API 는 통화별로 분리해 주므로 USD 를 환산해 합산한다.
+        rate = toss.exchange_rate("USD", "KRW")  # 0 이면 환산 불가 → KRW 만 집계
+        usd_krw = rate if rate > 0 else 0.0
+
         mv = (holdings.get("marketValue") or {}).get("amount") or {}
-        market_value = _f(mv.get("krw"))
-        equity = market_value + bp
+        market_value = _f(mv.get("krw")) + _f(mv.get("usd")) * usd_krw
         dp = (holdings.get("dailyProfitLoss") or {}).get("amount") or {}
-        daily_pnl = _f(dp.get("krw"))
+        daily_pnl = _f(dp.get("krw")) + _f(dp.get("usd")) * usd_krw
+        bp_krw = toss.buying_power("KRW")
+        bp_usd = toss.buying_power("USD")
+        buying_power = bp_krw + bp_usd * usd_krw
+        equity = market_value + buying_power
 
         items = []
         for it in (holdings.get("items") or []):
+            cur = it.get("currency") or "KRW"
+            fx = usd_krw if cur == "USD" else 1.0
             avg = _f(it.get("averagePurchasePrice"))
             last = _f(it.get("lastPrice"))
             qty = _f(it.get("quantity"))
+            native_eval = _f((it.get("marketValue") or {}).get("amount"))  # 종목 통화 기준 평가금액
             items.append({
                 "symbol": it.get("symbol"),
+                "name": it.get("name"),
+                "currency": cur,
                 "quantity": qty,
                 "avg": avg,
                 "last": last,
                 "pnl_pct": ((last - avg) / avg * 100) if avg else 0.0,
-                "eval_krw": last * qty,
+                "eval_krw": native_eval * fx,  # 원화 환산 평가금액(합계가 총자산과 일치)
             })
 
         open_ords = [{
@@ -166,10 +177,13 @@ def _gather() -> dict:
         out["account"] = {
             "equity": equity,
             "market_value": market_value,
-            "buying_power": bp,
+            "buying_power": buying_power,
+            "buying_power_krw": bp_krw,
             "daily_pnl": daily_pnl,
             "daily_pnl_pct": (daily_pnl / (equity - daily_pnl) * 100) if (equity - daily_pnl) else 0.0,
             "equity_change": (equity - eq_start) if eq_start else None,  # 킬스위치 기준 손익
+            "fx_rate": rate,            # USD→KRW (0 이면 환산 실패)
+            "has_usd": _f(mv.get("usd")) > 0 or bp_usd > 0,
             "holdings": items,
             "open_orders": open_ords,
         }
@@ -235,6 +249,7 @@ INDEX_HTML = """<!doctype html>
   <h1>토스 자동매매 대시보드</h1>
   <span id="mode" class="pill">—</span>
   <span id="kill" class="pill" style="display:none">🛑 킬스위치</span>
+  <span id="fx" class="pill" style="display:none">—</span>
   <span id="session" class="pill">—</span>
   <span class="pill" style="margin-left:auto" id="updated">연결 중…</span>
 </header>
@@ -278,6 +293,9 @@ const esc = s => (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&
 // 한국어 종목명 + 코드(작게). 이름이 없으면 코드만.
 const nm = sym => {const n=NAMES[sym]; return n && n!==sym
   ? `${esc(n)}<div class="mut" style="font-size:11px">${esc(sym)}</div>` : esc(sym);};
+// 종목 통화에 맞춰 표기. USD 는 $, 그 외는 원.
+const money = (n,cur) => (n==null||isNaN(n)) ? '—'
+  : (cur==='USD' ? '$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : won(n));
 
 function row(html){const tr=document.createElement('tr');tr.innerHTML=html;return tr;}
 function fill(id, rows, colspan, empty){
@@ -319,8 +337,15 @@ async function tick(){
     ec.innerHTML = a.equity_change==null ? '<span class="mut">집계 전</span>'
       : `<span class="${sgn(a.equity_change)}">${won(a.equity_change)}</span>`;
 
+    const fx=document.getElementById('fx');
+    if(a.has_usd){fx.style.display='';
+      fx.textContent = a.fx_rate ? 'USD/KRW '+Math.round(a.fx_rate).toLocaleString('ko-KR') : '환율 조회실패';
+      fx.className = 'pill'+(a.fx_rate?'':' kill');}
+    else fx.style.display='none';
+
     fill('holdings', a.holdings.map(h=>
-      `<td>${nm(h.symbol)}</td><td>${h.quantity}</td><td>${won(h.avg)}</td><td>${won(h.last)}</td>`+
+      `<td>${nm(h.symbol)}</td><td>${h.quantity}</td><td>${money(h.avg,h.currency)}</td>`+
+      `<td>${money(h.last,h.currency)}</td>`+
       `<td class="${sgn(h.pnl_pct)}">${pct(h.pnl_pct)}</td><td>${won(h.eval_krw)}</td>`),
       6, '보유 종목 없음');
 
@@ -329,6 +354,7 @@ async function tick(){
       `<td>${o.price?won(+o.price):'—'}</td><td>${o.quantity}</td><td class="mut">${o.status}</td>`),
       6, '미체결 주문 없음');
   }else{
+    document.getElementById('fx').style.display='none';
     ['equity','pnl','bp','eqchg'].forEach(id=>document.getElementById(id).textContent='—');
     fill('holdings',[],6,'계좌 조회 불가'); fill('open',[],6,'계좌 조회 불가');
   }

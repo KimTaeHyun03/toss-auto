@@ -166,6 +166,16 @@ class TossClient:
         except (TypeError, ValueError):
             return 0.0
 
+    def exchange_rate(self, base: str = "USD", quote: str = "KRW") -> float:
+        """환율(base→quote). 다통화 계좌 자산을 한 통화로 환산할 때 사용. 실패 시 0."""
+        res = self._get(
+            "/api/v1/exchange-rate", params={"baseCurrency": base, "quoteCurrency": quote}
+        ) or {}
+        try:
+            return float(res.get("rate", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def sellable_quantity(self, symbol: str) -> float:
         res = self._get("/api/v1/sellable-quantity", account=True, params={"symbol": symbol}) or {}
         # 스키마상 수량 필드명이 환경에 따라 다를 수 있어 방어적으로 탐색
