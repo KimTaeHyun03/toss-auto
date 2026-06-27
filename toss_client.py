@@ -104,6 +104,14 @@ class TossClient:
                 continue
         return out
 
+    def orderbook(self, symbol: str) -> dict:
+        """호가창 조회. {asks:[{price,volume}...](낮은가격순), bids:[...](높은가격순)}.
+
+        asks[0]=최우선 매도호가(최저), bids[0]=최우선 매수호가(최고).
+        호가 가격은 거래소가 주는 값이라 항상 유효 호가단위(틱)이다.
+        """
+        return self._get("/api/v1/orderbook", params={"symbol": symbol}) or {}
+
     def candles(self, symbol: str, interval: str = "1d", count: int = 20) -> list[dict]:
         """캔들 조회. interval: '1m' | '1d'. 결과는 {candles:[...]} 래퍼라 풀어서 반환."""
         res = self._get(
@@ -150,8 +158,9 @@ class TossClient:
     def holdings(self) -> dict:
         return self._get("/api/v1/holdings", account=True) or {}
 
-    def buying_power(self) -> float:
-        res = self._get("/api/v1/buying-power", account=True) or {}
+    def buying_power(self, currency: str = "KRW") -> float:
+        # currency 는 필수 쿼리 파라미터(KRW|USD). 누락 시 400(invalid-request, field=currency).
+        res = self._get("/api/v1/buying-power", account=True, params={"currency": currency}) or {}
         try:
             return float(res.get("cashBuyingPower", 0))
         except (TypeError, ValueError):
@@ -189,10 +198,24 @@ class TossClient:
         if order_type == "LIMIT":
             if price is None:
                 raise TossError("LIMIT 주문에는 price 가 필요합니다.")
-            body["price"] = str(price)
+            # 호가단위는 정수원 → 정수면 "10020.0" 가 아닌 "10020" 으로 보낸다.
+            body["price"] = str(int(price)) if float(price).is_integer() else str(price)
         if client_order_id:
             body["clientOrderId"] = client_order_id
         return self._post("/api/v1/orders", account=True, json=body) or {}
 
     def cancel_order(self, order_id: str) -> dict:
         return self._post(f"/api/v1/orders/{order_id}/cancel", account=True) or {}
+
+    # 아직 체결되지 않고 호가창에 남아있는(또는 취소/정정 대기) 상태들
+    OPEN_STATUSES = {"PENDING", "PENDING_CANCEL", "PENDING_REPLACE", "PARTIAL_FILLED"}
+
+    def open_orders(self) -> list[dict]:
+        """미체결(대기/부분체결) 주문 목록. 주문 중복 적재 방지에 사용.
+
+        status 는 필수 쿼리(OPEN|CLOSED) — 누락 시 400(field=status).
+        OPEN 으로 받은 뒤 세부 상태(OPEN_STATUSES)로 한 번 더 거른다(방어).
+        """
+        res = self._get("/api/v1/orders", account=True, params={"status": "OPEN"}) or {}
+        orders = res.get("orders", []) if isinstance(res, dict) else (res or [])
+        return [o for o in orders if o.get("status") in self.OPEN_STATUSES]

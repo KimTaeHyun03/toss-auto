@@ -26,6 +26,53 @@ class DailyState:
     trades: int = 0
     killed: bool = False
     kill_reason: str = ""
+    equity_start: float | None = None  # 일중 시작 자산(현금+평가액) 기준점
+
+
+def buy_orders_to_cancel(
+    open_orders: list[dict],
+    *,
+    last_prices: dict[str, float],
+    ref_prices: dict[str, float],
+    drop_pct: float,
+) -> list[tuple[dict, str]]:
+    """폭락한 미체결 '매수 지정가' 주문의 취소 대상과 사유를 판정(순수 함수).
+
+    open_orders : Order dict 리스트(side/orderType/price/symbol/status 포함)
+    last_prices : {symbol: 현재가}
+    ref_prices  : {symbol: 최근 N분 고점} — 없으면 키 누락 허용
+    drop_pct    : 취소 임계 하락률(%). 0 이하이면 비활성.
+
+    트리거(둘 중 하나라도 충족 시 취소):
+      A) 연속 하락 — 현재가가 최근 고점(ref) 대비 drop_pct% 이상 하락.
+         지정가보다 위에서 무너질 때 '체결 전에' 잡는다(사용자가 우려한 케이스).
+      B) 갭/VI 하락 — 현재가가 지정가(limit) 대비 drop_pct% 이상 낮음.
+         연속 거래에선 그 전에 체결되므로 갭다운·정지 후 재개 시의 안전망.
+    """
+    if drop_pct <= 0:
+        return []
+    thr = drop_pct / 100.0
+    out: list[tuple[dict, str]] = []
+    for o in open_orders:
+        if o.get("side") != "BUY" or o.get("orderType") != "LIMIT":
+            continue
+        if o.get("status") == "PENDING_CANCEL":  # 이미 취소 진행 중 → 중복 취소 방지
+            continue
+        sym = o.get("symbol")
+        last = last_prices.get(sym)
+        if last is None:
+            continue
+        try:
+            limit = float(o.get("price"))
+        except (TypeError, ValueError):
+            continue
+        ref = ref_prices.get(sym)
+        if ref and ref > 0 and (ref - last) / ref >= thr:  # A) 최근 고점 대비 폭락
+            out.append((o, f"최근고점 {ref:,.0f} 대비 {(ref - last) / ref * 100:.1f}% 폭락 (현재 {last:,.0f})"))
+            continue
+        if limit > 0 and (limit - last) / limit >= thr:  # B) 지정가 대비 갭다운
+            out.append((o, f"매수지정가 {limit:,.0f} 대비 {(limit - last) / limit * 100:.1f}% 낮음 (현재 {last:,.0f})"))
+    return out
 
 
 class RiskManager:
@@ -66,14 +113,23 @@ class RiskManager:
         )
 
     # ── 체크 ────────────────────────────────────────────────
-    def check_loss(self, daily_pnl_krw: float) -> None:
-        """당일 손익을 받아 손실 한도 초과 시 킬스위치를 켠다."""
-        if self.state.killed:
+    def update_equity(self, equity_now: float) -> None:
+        """현재 자산(현금+평가액)을 받아 일중 손실 한도 초과 시 킬스위치를 켠다.
+
+        보유종목 평가손익(dailyProfitLoss)이 아니라 '계좌 자산 변동'을 본다.
+        → 손절로 실현한 손실, 수수료·거래세가 모두 현금에 반영되므로
+          여러 번 손절매해 누적된 실현손실도 빠짐없이 잡힌다.
+        """
+        if self.state.equity_start is None:  # 그날 첫 관측을 기준점으로
+            self.state.equity_start = equity_now
+            self._save()
+            log.info("일중 시작 자산 기준: %s원", f"{equity_now:,.0f}")
             return
-        if daily_pnl_krw <= -abs(self.max_daily_loss_krw):
+        pnl = equity_now - self.state.equity_start
+        if not self.state.killed and pnl <= -abs(self.max_daily_loss_krw):
             self.state.killed = True
             self.state.kill_reason = (
-                f"일일 손실 한도 초과 (손익 {daily_pnl_krw:,.0f}원 ≤ -{self.max_daily_loss_krw:,}원)"
+                f"일일 손실 한도 초과 (자산변동 {pnl:,.0f}원 ≤ -{self.max_daily_loss_krw:,}원)"
             )
             self._save()
             log.error("🛑 킬스위치 발동: %s", self.state.kill_reason)

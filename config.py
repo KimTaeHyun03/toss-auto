@@ -26,6 +26,11 @@ def _int(name: str, default: int) -> int:
     return int(v) if v and v.strip() else default
 
 
+def _float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    return float(v) if v and v.strip() else default
+
+
 def _csv(name: str, default: list[str]) -> list[str]:
     v = os.getenv(name)
     if not v or not v.strip():
@@ -59,6 +64,18 @@ class Config:
     max_order_krw: int = field(default_factory=lambda: _int("MAX_ORDER_KRW", 100_000))
     max_trades_per_day: int = field(default_factory=lambda: _int("MAX_TRADES_PER_DAY", 5))
     max_daily_loss_krw: int = field(default_factory=lambda: _int("MAX_DAILY_LOSS_KRW", 50_000))
+
+    # 폭락 시 미체결 '매수 지정가' 주문 강제 취소.
+    #  - 현재가가 최근 N분 고점 대비(연속 하락) 또는 지정가 대비(갭다운) 이 % 이상 하락하면 취소.
+    #  - 0 이하이면 비활성. 킬스위치/주문횟수와 무관하게 동작(노출을 줄이는 행위).
+    cancel_buy_drop_pct: float = field(default_factory=lambda: _float("CANCEL_BUY_DROP_PCT", 3.0))
+    cancel_lookback_min: int = field(default_factory=lambda: _int("CANCEL_LOOKBACK_MIN", 10))
+
+    # 마케터블 리밋: 주문 직전 최신 호가로 약간 공격적으로 지정가를 걸어 체결률을 높임 (α=이 값/100).
+    #  매수=현재가×(1+α) 이하 중 최고 매도호가. 밴드 밖이면(갭업) 보류해 추격 매수를 막음(α=상한).
+    #  매도=현재가×(1−α) 이상 중 최저 매수호가. 밴드 밖이면(폭락) 손절 위해 최우선 매수호가로 크로스.
+    #  호가 사다리에서 스냅하므로 항상 유효 틱. 0이면 비활성(최신 현재가로 그대로 지정가).
+    marketable_limit_pct: float = field(default_factory=lambda: _float("MARKETABLE_LIMIT_PCT", 0.3))
 
     # 매매를 허용할 세션 (pre=프리마켓, regular=정규장, after=애프터마켓)
     trade_sessions: list[str] = field(
