@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request, abort
 
+import db
 from config import Config
 from toss_client import TossClient, TossError
 
@@ -88,7 +89,9 @@ def _daily_state() -> dict:
 
 
 def _recent_orders(limit: int = 25) -> list[dict]:
-    """orders.csv 최근 주문(최신순)."""
+    """최근 주문(최신순). DATABASE_URL 있으면 Postgres, 없으면 orders.csv."""
+    if db.enabled():
+        return db.recent_orders(limit)
     if not ORDERS_CSV.exists():
         return []
     try:
@@ -393,6 +396,7 @@ tick(); setInterval(tick, REFRESH*1000);
 
 
 if __name__ == "__main__":
+    db.init()  # orders 테이블 준비(DATABASE_URL 없으면 무동작)
     host = os.getenv("DASHBOARD_HOST", "127.0.0.1")  # 배포 시 start.sh 가 0.0.0.0 으로 덮어씀
     port = int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "8787"))  # Cloudtype 는 PORT 주입
     log.info("대시보드 시작: http://%s:%d  (DRY_RUN=%s, 캐시=%ss)", host, port, cfg.dry_run, _CACHE_TTL)

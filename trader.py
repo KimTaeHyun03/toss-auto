@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import db
 from config import Config
 from claude_engine import ClaudeEngine, Decision
 from market import market_status, resolve_allowed, SESSION_LABELS
@@ -221,7 +222,15 @@ _AUDIT_PATH = Path(__file__).parent / "state" / "orders.csv"
 
 
 def _audit(d, price: float, est: float, *, order_id: str, dry_run: bool, note: str = "") -> None:
-    """주문 1건을 state/orders.csv 에 누적 기록(전략 평가용 영속 감사 로그)."""
+    """주문 1건을 감사 로그로 남긴다. DATABASE_URL 있으면 Postgres, 없으면 CSV."""
+    ts = datetime.now(KST)
+    if db.insert_order(
+        ts=ts, symbol=d.symbol, side=d.action, qty=d.quantity, price=price, est_krw=est,
+        order_id=order_id, dry_run=dry_run, confidence=d.confidence, reason=d.reason, review_note=note,
+    ):
+        return  # DB 적재 성공 → CSV 생략
+
+    # 폴백: state/orders.csv 누적
     new = not _AUDIT_PATH.exists()
     try:
         with _AUDIT_PATH.open("a", encoding="utf-8", newline="") as f:
@@ -365,6 +374,7 @@ def main() -> None:
     cfg = Config()
     cfg.validate()
     _acquire_lock()
+    db.init()  # DATABASE_URL 있으면 orders 테이블 준비(없으면 무동작)
 
     log.info("=" * 60)
     log.info("토스 자동매매 시작 | DRY_RUN=%s", cfg.dry_run)
