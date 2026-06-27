@@ -16,6 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import db
+import paper
 from config import Config
 from claude_engine import ClaudeEngine, Decision
 from market import market_status, resolve_allowed, SESSION_LABELS
@@ -172,30 +173,30 @@ def resolve_order_price(
         return min(within) if within else bids[0]
 
 
-def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price: float | None) -> None:
-    """단일 판단 실행."""
+def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price: float | None) -> str:
+    """단일 판단 실행. 결과 상태 문자열을 반환(판단 로그용)."""
     if d.action == "HOLD" or d.quantity <= 0:
         log.info("• %s HOLD (conf=%.2f) — %s", d.symbol, d.confidence, d.reason)
-        return
+        return "HOLD"
 
     # #1 주문 직전 최신가 재조회 + #2 마케터블 리밋 산출 (ctx 스냅샷 price 는 폴백)
     price = resolve_order_price(toss, cfg, d.symbol, d.action, fallback=price)
     if price is None:
         log.warning("• %s %s 스킵: 주문가 미확보/보류", d.symbol, d.action)
-        return
+        return "SKIP_NO_PRICE"
 
     est = price * d.quantity
     ok, why = risk.validate_order(est_amount_krw=est)
     if not ok:
         log.warning("• %s %s x%d 거부: %s", d.symbol, d.action, d.quantity, why)
-        return
+        return "REJECT_RISK"
 
     # 매도는 보유 수량 검증
     if d.action == "SELL":
         sellable = toss.sellable_quantity(d.symbol)
         if d.quantity > sellable:
             log.warning("• %s SELL x%d 거부: 매도가능 %s주", d.symbol, d.quantity, sellable)
-            return
+            return "SKIP_NOT_SELLABLE"
 
     client_order_id = uuid.uuid4().hex[:32]  # 멱등키 — 타임아웃 재시도 시 중복주문 방지
     log.info(
@@ -206,8 +207,9 @@ def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price
     if cfg.dry_run:
         log.info("  [DRY_RUN] 실제 주문은 내지 않음. (clientOrderId=%s)", client_order_id)
         _audit(d, price, est, order_id="DRY_RUN", dry_run=True, note=d.review_note)
+        paper.record_fill(ts=datetime.now(KST), symbol=d.symbol, side=d.action, qty=d.quantity, price=price)
         risk.record_trade()
-        return
+        return "EXECUTED"
 
     try:
         res = toss.create_order(
@@ -221,8 +223,10 @@ def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price
         log.info("  ✅ 주문 접수: orderId=%s", res.get("orderId"))
         _audit(d, price, est, order_id=str(res.get("orderId")), dry_run=False, note=d.review_note)
         risk.record_trade()
+        return "EXECUTED"
     except TossError as e:
         log.error("  ❌ 주문 실패: %s", e)
+        return "FAIL_API"
 
 
 _AUDIT_PATH = Path(__file__).parent / "state" / "orders.csv"
@@ -352,13 +356,21 @@ def run_once(toss: TossClient, engine: ClaudeEngine, risk: RiskManager, cfg: Con
     # 6) Claude 판단
     decisions = engine.decide(ctx)
 
-    # 7) 실행 (미체결 주문 있는 종목은 건너뜀)
+    # 7) 실행 (미체결 주문 있는 종목은 건너뜀) + 모든 판단을 decisions 테이블에 기록
     prices = ctx.get("prices", {})
+    session_label = ctx.get("session", "")
+    ts = datetime.now(KST)
     for d in decisions:
         if d.action in ("BUY", "SELL") and d.symbol in resting:
             log.info("• %s %s 스킵: 해당 종목 미체결 주문 존재", d.symbol, d.action)
-            continue
-        execute(toss, risk, cfg, d, prices.get(d.symbol))
+            outcome = "SKIP_RESTING"
+        else:
+            outcome = execute(toss, risk, cfg, d, prices.get(d.symbol))
+        db.insert_decision(
+            ts=ts, symbol=d.symbol, session=session_label, last_price=prices.get(d.symbol),
+            action=d.action, qty=d.quantity, confidence=d.confidence,
+            reviewed=d.reviewed, review_note=d.review_note, reason=d.reason, outcome=outcome,
+        )
 
 
 def _acquire_lock() -> None:
@@ -381,7 +393,8 @@ def main() -> None:
     cfg = Config()
     cfg.validate()
     _acquire_lock()
-    db.init()  # DATABASE_URL 있으면 orders 테이블 준비(없으면 무동작)
+    db.init()  # DATABASE_URL 있으면 orders/decisions 테이블 준비(없으면 무동작)
+    paper.init()  # 페이퍼 가상계좌 준비(시작 현금)
 
     log.info("=" * 60)
     log.info("토스 자동매매 시작 | DRY_RUN=%s", cfg.dry_run)

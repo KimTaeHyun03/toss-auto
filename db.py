@@ -16,7 +16,8 @@ log = logging.getLogger("db")
 
 _DSN = os.getenv("DATABASE_URL", "").strip()
 
-_SCHEMA = """
+# orders = 실제로 나간 주문 원장 / decisions = 매 사이클 모든 판단(HOLD·반려 포함)
+_SCHEMA_ORDERS = """
 CREATE TABLE IF NOT EXISTS orders (
     id          BIGSERIAL PRIMARY KEY,
     ts_kst      TIMESTAMPTZ NOT NULL,
@@ -30,6 +31,23 @@ CREATE TABLE IF NOT EXISTS orders (
     confidence  NUMERIC,
     reason      TEXT,
     review_note TEXT
+);
+"""
+
+_SCHEMA_DECISIONS = """
+CREATE TABLE IF NOT EXISTS decisions (
+    id          BIGSERIAL PRIMARY KEY,
+    ts_kst      TIMESTAMPTZ NOT NULL,
+    symbol      TEXT NOT NULL,
+    session     TEXT,            -- 프리/정규/애프터
+    last_price  NUMERIC,         -- 판단 당시 현재가
+    action      TEXT,            -- 최종 판단 BUY/SELL/HOLD
+    qty         INTEGER,         -- 제안 수량
+    confidence  NUMERIC,         -- 1차 확신도
+    reviewed    BOOLEAN,         -- 2차 검증 거쳤는지
+    review_note TEXT,            -- 2차 검증 사유
+    reason      TEXT,            -- 1차 판단 근거
+    outcome     TEXT             -- EXECUTED/HOLD/SKIP_*/REJECT_*/FAIL_*
 );
 """
 
@@ -49,8 +67,9 @@ def init() -> None:
         return
     try:
         with _connect() as c, c.cursor() as cur:
-            cur.execute(_SCHEMA)
-        log.info("DB 스키마 준비 완료")
+            cur.execute(_SCHEMA_ORDERS)
+            cur.execute(_SCHEMA_DECISIONS)
+        log.info("DB 스키마 준비 완료 (orders, decisions)")
     except Exception as e:  # noqa: BLE001
         log.warning("DB 초기화 실패(%s) — CSV 폴백", e)
 
@@ -73,6 +92,27 @@ def insert_order(
         return True
     except Exception as e:  # noqa: BLE001
         log.warning("DB 주문기록 실패(%s) — CSV 폴백", e)
+        return False
+
+
+def insert_decision(
+    *, ts: datetime, symbol: str, session: str, last_price, action: str, qty: int,
+    confidence, reviewed: bool, review_note: str, reason: str, outcome: str,
+) -> bool:
+    """판단 1건(HOLD 포함) 적재. DB 비활성이면 무동작(판단 로그는 DB 전용)."""
+    if not enabled():
+        return False
+    try:
+        with _connect() as c, c.cursor() as cur:
+            cur.execute(
+                """INSERT INTO decisions
+                   (ts_kst,symbol,session,last_price,action,qty,confidence,reviewed,review_note,reason,outcome)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (ts, symbol, session, last_price, action, qty, confidence, reviewed, review_note, reason, outcome),
+            )
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("DB 판단기록 실패(%s)", e)
         return False
 
 

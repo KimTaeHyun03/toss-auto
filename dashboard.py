@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, abort
 
 import db
+import paper
 from config import Config
 from toss_client import TossClient, TossError
 
@@ -196,6 +197,16 @@ def _gather() -> dict:
         log.warning("토스 조회 실패: %s", e)
         out["error"] = f"토스 API 조회 실패: {e}"
         out["account"] = None
+    # 페이퍼(모의) 포트폴리오 — 실제 계좌와 별개의 100만원 가상계좌 성과
+    try:
+        psyms = paper.position_symbols()
+        pprices = toss.prices(psyms) if psyms else {}
+    except TossError:
+        pprices = {}
+    out["paper"] = paper.snapshot(pprices)
+    if out["paper"]:
+        all_syms += [p["symbol"] for p in out["paper"]["positions"]]
+
     out["names"] = _resolve_names(all_syms)  # symbol → 한국어 종목명
     return out
 
@@ -285,7 +296,22 @@ INDEX_HTML = """<!doctype html>
     <div class="card"><div class="k">시작 대비(킬스위치 기준)</div><div class="v" id="eqchg">—</div></div>
     <div class="card"><div class="k">오늘 주문</div><div class="v" id="trades">—</div></div>
   </div>
-  <section><h2>보유 종목</h2>
+  <section id="paper-sec" style="display:none">
+    <h2>📄 페이퍼(모의) 포트폴리오 — 봇 성과</h2>
+    <div class="row">
+      <div class="card"><div class="k">평가자산</div><div class="v" id="p_equity">—</div></div>
+      <div class="card"><div class="k">총손익(시작대비)</div><div class="v" id="p_total">—</div></div>
+      <div class="card"><div class="k">실현손익</div><div class="v" id="p_realized">—</div></div>
+      <div class="card"><div class="k">미실현손익</div><div class="v" id="p_unreal">—</div></div>
+      <div class="card"><div class="k">현금</div><div class="v" id="p_cash">—</div></div>
+    </div>
+    <div class="card" style="padding:0;margin-top:12px">
+      <table><thead><tr><th>종목</th><th>수량</th><th>평단</th><th>현재가</th>
+        <th>평가손익%</th><th>평가금액</th></tr></thead>
+        <tbody id="p_pos"><tr><td colspan="6" class="empty">—</td></tr></tbody></table>
+    </div>
+  </section>
+  <section><h2>실제 계좌 보유 종목</h2>
     <div class="card" style="padding:0">
       <table><thead><tr><th>종목</th><th>수량</th><th>평단</th><th>현재가</th>
         <th>평가손익%</th><th>평가금액</th></tr></thead>
@@ -382,6 +408,22 @@ async function tick(){
     fill('holdings',[],6,'계좌 조회 불가'); fill('open',[],6,'계좌 조회 불가');
   }
 
+  const pp = d.paper;
+  const psec = document.getElementById('paper-sec');
+  if(pp){
+    psec.style.display='';
+    document.getElementById('p_equity').textContent = won(pp.equity);
+    document.getElementById('p_total').innerHTML =
+      `<span class="${sgn(pp.total_pnl)}">${won(pp.total_pnl)} (${pct(pp.total_pnl_pct)})</span>`;
+    document.getElementById('p_realized').innerHTML = `<span class="${sgn(pp.realized_pnl)}">${won(pp.realized_pnl)}</span>`;
+    document.getElementById('p_unreal').innerHTML = `<span class="${sgn(pp.unreal_pnl)}">${won(pp.unreal_pnl)}</span>`;
+    document.getElementById('p_cash').textContent = won(pp.cash);
+    fill('p_pos', pp.positions.map(h=>
+      `<td>${nm(h.symbol)}</td><td>${h.qty}</td><td>${won(h.avg)}</td><td>${won(h.last)}</td>`+
+      `<td class="${sgn(h.pnl_pct)}">${pct(h.pnl_pct)}</td><td>${won(h.eval_krw)}</td>`),
+      6, '보유 없음 (아직 모의 체결 없음)');
+  } else { psec.style.display='none'; }
+
   fill('orders', d.orders.map(o=>{
     const t=(o.ts_kst||'').replace('T',' ').slice(5,19);
     return `<td>${t}</td><td>${nm(o.symbol)}</td><td class="side-${o.side}">${o.side}</td>`+
@@ -396,7 +438,8 @@ tick(); setInterval(tick, REFRESH*1000);
 
 
 if __name__ == "__main__":
-    db.init()  # orders 테이블 준비(DATABASE_URL 없으면 무동작)
+    db.init()      # orders/decisions 테이블 준비(DATABASE_URL 없으면 무동작)
+    paper.init()   # 페이퍼 가상계좌 테이블 준비
     host = os.getenv("DASHBOARD_HOST", "127.0.0.1")  # 배포 시 start.sh 가 0.0.0.0 으로 덮어씀
     port = int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "8787"))  # Cloudtype 는 PORT 주입
     log.info("대시보드 시작: http://%s:%d  (DRY_RUN=%s, 캐시=%ss)", host, port, cfg.dry_run, _CACHE_TTL)
