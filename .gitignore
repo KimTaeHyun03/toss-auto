@@ -1,0 +1,14 @@
+# 자격증명 / 비밀
+.env
+*.key
+
+# 상태/로그 (실거래 기록)
+state/
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
