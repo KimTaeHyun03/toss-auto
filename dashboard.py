@@ -262,6 +262,7 @@ INDEX_HTML = """<!doctype html>
   .pill.dry{color:#000;background:var(--warn);border-color:var(--warn)}
   .pill.kill{color:#fff;background:var(--up);border-color:var(--up)}
   main{padding:20px;max-width:1100px;margin:0 auto;display:grid;gap:16px}
+  main>*{min-width:0}  /* 그리드 아이템이 넓은 표 min-content 때문에 안 줄어드는 것 방지(가로 넘침) */
   .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
   .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px}
   .card .k{color:var(--mut);font-size:12px;margin-bottom:6px}
