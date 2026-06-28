@@ -310,7 +310,7 @@ INDEX_HTML = """<!doctype html>
     <div class="card"><div class="k">오늘 주문</div><div class="v" id="trades">—</div></div>
   </div>
   <section id="paper-sec" style="display:none">
-    <h2>📄 페이퍼(모의) 포트폴리오 — 봇 성과</h2>
+    <h2>📄 페이퍼(모의) 포트폴리오 — 봇 성과 (지정가 즉시 전량체결 가정 · 실제 체결 아님)</h2>
     <div class="row">
       <div class="card"><div class="k">평가자산</div><div class="v" id="p_equity">—</div></div>
       <div class="card"><div class="k">총손익(시작대비)</div><div class="v" id="p_total">—</div></div>
@@ -336,7 +336,7 @@ INDEX_HTML = """<!doctype html>
         <th>수량</th><th>상태</th></tr></thead>
         <tbody id="open"><tr><td colspan="6" class="empty">—</td></tr></tbody></table>
     </div></section>
-  <section><h2>최근 주문 (orders.csv)</h2>
+  <section><h2>최근 주문 — 주문 접수 기록 (체결 보장 아님 · 실제 체결은 위 보유/미체결 확인)</h2>
     <div class="card" style="padding:0">
       <table><thead><tr><th>시각</th><th>종목</th><th>구분</th><th>수량</th><th>가격</th>
         <th>예상금액</th><th>conf</th><th>모드</th><th>사유</th></tr></thead>

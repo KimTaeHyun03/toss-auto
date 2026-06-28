@@ -54,6 +54,11 @@ class Config:
     kospi_proxy_symbol: str = field(default_factory=lambda: os.getenv("KOSPI_PROXY_SYMBOL", "069500"))
     trade_symbols: list[str] = field(default_factory=lambda: _csv("TRADE_SYMBOLS", ["069500"]))
 
+    # 캔들(봉): Claude 판단용으로 종목별 OHLCV 봉을 함께 제공해 추세/패턴을 읽게 함.
+    #  종목 수만큼 사이클마다 API 콜 + ctx 토큰이 늘므로 개수는 보수적으로(기본 일봉 15개).
+    candle_interval: str = field(default_factory=lambda: os.getenv("CANDLE_INTERVAL", "1d"))
+    candle_count: int = field(default_factory=lambda: _int("CANDLE_COUNT", 15))
+
     # 동적 종목 선정: Claude 가 뉴스/시장을 web_search 로 조사해 그날 매매 후보를 직접 고름
     dynamic_universe: bool = field(default_factory=lambda: _bool("DYNAMIC_UNIVERSE", False))
     max_universe: int = field(default_factory=lambda: _int("MAX_UNIVERSE", 8))

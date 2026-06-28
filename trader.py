@@ -51,14 +51,16 @@ def build_context(toss: TossClient, cfg: Config, symbols: list[str], universe: l
     all_symbols = list(dict.fromkeys([proxy, *symbols]))  # 중복 제거, 순서 유지
     prices = toss.prices(all_symbols)
 
-    # 코스피 프록시 추세(일봉 종가 최근 10개). Candle.closePrice 는 문자열 → float.
-    proxy_candles = toss.candles(proxy, interval="1d", count=10)
-    proxy_closes: list[float] = []
-    for c in proxy_candles:
+    # 코스피 프록시 추세 + 대상 종목 봉(OHLCV). AI 가 시고저종·거래량으로 추세/패턴을 읽도록 전달.
+    iv, cnt = cfg.candle_interval, cfg.candle_count
+    proxy_candles = _ohlcv(toss.candles(proxy, interval=iv, count=cnt))
+    candles_by_symbol: dict[str, list] = {}
+    for s in symbols:  # 한 종목 조회 실패가 전체를 막지 않게 개별 try
         try:
-            proxy_closes.append(float(c["closePrice"]))
-        except (KeyError, TypeError, ValueError):
-            continue
+            candles_by_symbol[s] = _ohlcv(toss.candles(s, interval=iv, count=cnt))
+        except TossError as e:
+            log.warning("• %s 캔들 조회 실패: %s", s, e)
+            candles_by_symbol[s] = []
 
     holdings = toss.holdings()
     buying_power = toss.buying_power()
@@ -82,9 +84,11 @@ def build_context(toss: TossClient, cfg: Config, symbols: list[str], universe: l
 
     ctx = {
         "now_kst": datetime.now(KST).isoformat(),
-        "kospi_proxy": {"symbol": proxy, "last_price": prices.get(proxy), "recent_daily_closes": proxy_closes},
+        "candle_format": f"봉(캔들) 한 칸 = [날짜, 시가, 고가, 저가, 종가, 거래량] (간격 {iv}, 과거→현재 순)",
+        "kospi_proxy": {"symbol": proxy, "last_price": prices.get(proxy), "candles": proxy_candles},
         "symbols": symbols,
         "prices": {s: prices.get(s) for s in symbols},
+        "candles": {s: candles_by_symbol.get(s, []) for s in symbols},
         "buying_power_krw": buying_power,
         "equity_krw": equity_krw,
         "holdings": held,
@@ -97,6 +101,26 @@ def build_context(toss: TossClient, cfg: Config, symbols: list[str], universe: l
     if universe:  # 동적 선정 시 각 종목의 선정 사유(뉴스 근거)를 함께 전달
         ctx["screening_reasons"] = {u["symbol"]: u.get("reason", "") for u in universe}
     return ctx
+
+
+def _ohlcv(candles: list[dict]) -> list[list]:
+    """캔들 리스트 → [날짜, 시가, 고가, 저가, 종가, 거래량] 배열들(과거→현재 순).
+
+    Candle 의 가격/거래량은 전부 문자열이라 float 로 변환한다. 토큰 절약을 위해
+    dict 대신 압축 배열로 담고, 키 순서 의미는 ctx['candle_format'] 로 AI 에 알린다.
+    """
+    out: list[list] = []
+    for c in candles:
+        try:
+            out.append([
+                str(c.get("timestamp", ""))[:10],
+                float(c["openPrice"]), float(c["highPrice"]),
+                float(c["lowPrice"]), float(c["closePrice"]),
+                float(c.get("volume", 0) or 0),
+            ])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
 
 
 def _daily_pnl(holdings: dict) -> float:
@@ -207,9 +231,10 @@ def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price
     if cfg.dry_run:
         log.info("  [DRY_RUN] 실제 주문은 내지 않음. (clientOrderId=%s)", client_order_id)
         _audit(d, price, est, order_id="DRY_RUN", dry_run=True, note=d.review_note)
+        # 페이퍼는 지정가 즉시 전량체결을 '가정'한 모의 결과(실제 체결 보장 아님).
         paper.record_fill(ts=datetime.now(KST), symbol=d.symbol, side=d.action, qty=d.quantity, price=price)
         risk.record_trade()
-        return "EXECUTED"
+        return "PAPER_FILL"
 
     try:
         res = toss.create_order(
@@ -220,10 +245,12 @@ def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price
             price=price,
             client_order_id=client_order_id,
         )
-        log.info("  ✅ 주문 접수: orderId=%s", res.get("orderId"))
+        # 주문 '접수' 성공일 뿐 '체결'이 아니다(LIMIT 은 미체결로 남을 수 있음).
+        # 실제 체결 여부는 대시보드의 토스 실계좌 보유/미체결 뷰에서 확인한다.
+        log.info("  ✅ 주문 접수(체결 미확정): orderId=%s", res.get("orderId"))
         _audit(d, price, est, order_id=str(res.get("orderId")), dry_run=False, note=d.review_note)
         risk.record_trade()
-        return "EXECUTED"
+        return "SUBMITTED"
     except TossError as e:
         log.error("  ❌ 주문 실패: %s", e)
         return "FAIL_API"

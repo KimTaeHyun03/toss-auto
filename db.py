@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     reviewed    BOOLEAN,         -- 2차 검증 거쳤는지
     review_note TEXT,            -- 2차 검증 사유
     reason      TEXT,            -- 1차 판단 근거
-    outcome     TEXT             -- EXECUTED/HOLD/SKIP_*/REJECT_*/FAIL_*
+    outcome     TEXT             -- SUBMITTED(접수,체결미확정)/PAPER_FILL(모의가정체결)/HOLD/SKIP_*/REJECT_*/FAIL_*
 );
 """
 
