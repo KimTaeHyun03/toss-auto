@@ -277,6 +277,18 @@ INDEX_HTML = """<!doctype html>
   .err{background:#3d1418;border:1px solid var(--up);color:#ffb3b0;padding:10px 14px;border-radius:8px}
   .side-BUY{color:var(--up)} .side-SELL{color:var(--down)}
   footer{color:var(--mut);font-size:12px;text-align:center;padding:0 0 24px}
+  .card:has(table){overflow-x:auto;-webkit-overflow-scrolling:touch}  /* 좁은 화면: 표 가로 스크롤 */
+  @media (max-width:640px){
+    body{font-size:13px}
+    header{flex-wrap:wrap;padding:12px 14px;gap:8px}
+    header h1{font-size:15px;width:100%}
+    main{padding:12px;gap:12px}
+    .row{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+    .card{padding:12px 14px}
+    .card .v{font-size:18px}
+    th,td{padding:6px 8px}
+    footer{padding:0 12px 24px}
+  }
 </style></head>
 <body>
 <header>

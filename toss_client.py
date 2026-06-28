@@ -18,14 +18,25 @@
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from pathlib import Path
 
 import requests
 
 from config import TOSS_BASE_URL
 
 log = logging.getLogger("toss")
+
+# 토큰 공유 파일(L2 캐시). trader 와 dashboard 가 같은 컨테이너/볼륨에서 같은 자격증명으로
+# 각자 토큰을 발급하면, 토스는 클라이언트당 활성 토큰을 1개만 인정하므로 서로의 토큰을
+# 무효화한다(상대 토큰이 만료 전인데 401 invalid-token). 한 파일을 공유해 활성 토큰을
+# 하나로 수렴시킨다. /app/state 는 영속 볼륨(없으면 state/ 폴더).
+_TOKEN_FILE = Path(
+    os.getenv("TOSS_TOKEN_FILE", str(Path(__file__).parent / "state" / "toss_token.json"))
+)
 
 
 class TossError(RuntimeError):
@@ -42,10 +53,35 @@ class TossClient:
         self._s = requests.Session()
 
     # ── 인증 ────────────────────────────────────────────────
-    def _access_token(self) -> str:
-        # 만료 60초 전이면 갱신
-        if self._token and time.time() < self._token_exp - 60:
-            return self._token
+    def _read_token_file(self) -> dict | None:
+        """공유 토큰 파일(L2)을 읽는다. 자격증명이 다르면 무시. 없으면 None."""
+        try:
+            d = json.loads(_TOKEN_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(d, dict) or d.get("client_id") != self._client_id:
+            return None
+        return d
+
+    def _write_token_file(self, token: str, exp: float) -> None:
+        """공유 토큰 파일에 원자적으로 기록(다른 프로세스가 주워 쓰도록)."""
+        try:
+            _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _TOKEN_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"token": token, "exp": exp, "client_id": self._client_id}),
+                encoding="utf-8",
+            )
+            os.replace(tmp, _TOKEN_FILE)  # 원자적 교체
+            try:
+                os.chmod(_TOKEN_FILE, 0o600)  # 자격증명 준함 → 권한 축소
+            except OSError:
+                pass
+        except OSError as e:
+            log.warning("토큰 파일 기록 실패(무시): %s", e)
+
+    def _issue_token(self) -> str:
+        """토스에서 새 토큰을 발급받고 L1(메모리)+L2(파일)에 기록."""
         r = self._s.post(
             f"{TOSS_BASE_URL}/oauth2/token",
             data={
@@ -60,8 +96,42 @@ class TossClient:
         data = r.json()
         self._token = data["access_token"]
         self._token_exp = time.time() + int(data.get("expires_in", 3600))
+        self._write_token_file(self._token, self._token_exp)
         log.info("액세스 토큰 발급 완료 (expires_in=%ss)", data.get("expires_in"))
         return self._token
+
+    def _access_token(self) -> str:
+        # 1) L1(메모리) 토큰이 만료 60초 전이면 그대로 사용
+        if self._token and time.time() < self._token_exp - 60:
+            return self._token
+        # 2) L2(공유 파일)에 유효 토큰이 있으면 채택 — 다른 프로세스가 갱신했을 수 있음
+        d = self._read_token_file()
+        if d and time.time() < float(d.get("exp", 0)) - 60:
+            self._token = d["token"]
+            self._token_exp = float(d["exp"])
+            return self._token
+        # 3) 둘 다 없음/만료 → 신규 발급
+        return self._issue_token()
+
+    def _recover_after_401(self) -> bool:
+        """401(invalid-token) 후 토큰 회복. 파일에 *방금 실패한 것과 다른* 토큰이 있으면
+        그걸 채택(재발급 안 함 → ping-pong 방지), 없으면 신규 발급. 회복 시 True."""
+        failed = self._token
+        d = self._read_token_file()
+        if d and d.get("token") and d["token"] != failed:
+            self._token = d["token"]
+            self._token_exp = float(d.get("exp", 0))
+            log.info("401 → 공유 파일의 새 토큰 채택")
+            return True
+        # 파일에도 실패한 토큰뿐(또는 없음) → 강제 신규 발급
+        self._token = None
+        try:
+            self._issue_token()
+        except TossError as e:
+            log.warning("401 후 토큰 재발급 실패: %s", e)
+            return False
+        log.info("401 → 토큰 신규 발급")
+        return True
 
     def _headers(self, account: bool = False) -> dict[str, str]:
         h = {"Authorization": f"Bearer {self._access_token()}"}
@@ -71,17 +141,24 @@ class TossClient:
             h["X-Tossinvest-Account"] = str(self.account_seq)
         return h
 
-    def _get(self, path: str, *, account: bool = False, params: dict | None = None):
-        r = self._s.get(
-            f"{TOSS_BASE_URL}{path}", headers=self._headers(account), params=params, timeout=10
+    def _request(self, method: str, path: str, *, account: bool = False,
+                 params: dict | None = None, json: dict | None = None):
+        """공통 요청. 401 이면 토큰 회복 후 1회 재시도(다른 프로세스의 토큰 무효화 대응)."""
+        url = f"{TOSS_BASE_URL}{path}"
+        r = self._s.request(
+            method, url, headers=self._headers(account), params=params, json=json, timeout=10
         )
+        if r.status_code == 401 and self._recover_after_401():
+            r = self._s.request(
+                method, url, headers=self._headers(account), params=params, json=json, timeout=10
+            )
         return self._unwrap(r)
 
+    def _get(self, path: str, *, account: bool = False, params: dict | None = None):
+        return self._request("GET", path, account=account, params=params)
+
     def _post(self, path: str, *, account: bool = False, json: dict | None = None):
-        r = self._s.post(
-            f"{TOSS_BASE_URL}{path}", headers=self._headers(account), json=json, timeout=10
-        )
-        return self._unwrap(r)
+        return self._request("POST", path, account=account, json=json)
 
     @staticmethod
     def _unwrap(r: requests.Response):
