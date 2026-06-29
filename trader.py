@@ -62,25 +62,12 @@ def build_context(toss: TossClient, cfg: Config, symbols: list[str], universe: l
             log.warning("• %s 캔들 조회 실패: %s", s, e)
             candles_by_symbol[s] = []
 
-    holdings = toss.holdings()
-    buying_power = toss.buying_power()
-
-    # 계좌 자산(equity) = 보유 평가금액 + 현금매수가능액 → 킬스위치 기준
-    mv = (holdings.get("marketValue") or {}).get("amount") or {}
-    try:
-        market_value_krw = float(mv.get("krw", 0) or 0)
-    except (TypeError, ValueError):
-        market_value_krw = 0.0
-    equity_krw = market_value_krw + buying_power
-
-    held = {
-        it.get("symbol"): {
-            "quantity": it.get("quantity"),
-            "averagePurchasePrice": it.get("averagePurchasePrice"),
-            "lastPrice": it.get("lastPrice"),
-        }
-        for it in (holdings.get("items") or [])
-    }
+    # 잔고/보유: DRY_RUN(모의)이면 페이퍼 가상계좌(100만), 실거래면 실계좌 기준.
+    #  AI 가 페이퍼 현금·보유를 보고 판단해야 가상자금을 운용한다(실계좌를 보면 실보유 매도·현금 0 인식).
+    if cfg.dry_run:
+        buying_power, equity_krw, held, daily_pnl = _paper_account_view(prices)
+    else:
+        buying_power, equity_krw, held, daily_pnl = _real_account_view(toss)
 
     ctx = {
         "now_kst": datetime.now(KST).isoformat(),
@@ -92,7 +79,7 @@ def build_context(toss: TossClient, cfg: Config, symbols: list[str], universe: l
         "buying_power_krw": buying_power,
         "equity_krw": equity_krw,
         "holdings": held,
-        "daily_profit_loss_krw": _daily_pnl(holdings),
+        "daily_profit_loss_krw": daily_pnl,
         "limits": {
             "max_order_krw": cfg.max_order_krw,
             "note": "주문 수량은 이 금액과 매수가능금액을 넘지 않게 보수적으로 제시할 것",
@@ -131,6 +118,47 @@ def _daily_pnl(holdings: dict) -> float:
         return float(amount.get("krw", 0))
     except (TypeError, ValueError, AttributeError):
         return 0.0
+
+
+def _real_account_view(toss: TossClient) -> tuple[float, float, dict, float]:
+    """실계좌 기준 (매수가능액, 자산, 보유dict, 당일손익). 실거래 모드용."""
+    holdings = toss.holdings()
+    buying_power = toss.buying_power()
+    # 계좌 자산(equity) = 보유 평가금액 + 현금매수가능액 → 킬스위치 기준
+    mv = (holdings.get("marketValue") or {}).get("amount") or {}
+    try:
+        market_value_krw = float(mv.get("krw", 0) or 0)
+    except (TypeError, ValueError):
+        market_value_krw = 0.0
+    held = {
+        it.get("symbol"): {
+            "quantity": it.get("quantity"),
+            "averagePurchasePrice": it.get("averagePurchasePrice"),
+            "lastPrice": it.get("lastPrice"),
+        }
+        for it in (holdings.get("items") or [])
+    }
+    return buying_power, market_value_krw + buying_power, held, _daily_pnl(holdings)
+
+
+def _paper_account_view(prices: dict) -> tuple[float, float, dict, float]:
+    """페이퍼 가상계좌 기준 (현금, 자산, 보유dict, 평가손익). DRY_RUN 모의투자용.
+
+    DB 미사용(로컬 등)이면 시작현금만 든 빈 계좌로 간주한다. daily_pnl 자리에는
+    페이퍼는 일자 구분 손익이 없어 보유 평가손익(unrealized)을 넣는다(AI 참고용).
+    """
+    snap = paper.snapshot(prices)
+    if snap is None:  # DB 미사용 → 시작현금만 있는 빈 계좌
+        return paper.START_KRW, paper.START_KRW, {}, 0.0
+    held = {
+        p["symbol"]: {
+            "quantity": p["qty"],
+            "averagePurchasePrice": p["avg"],
+            "lastPrice": p["last"],
+        }
+        for p in snap.get("positions", [])
+    }
+    return snap["cash"], snap["equity"], held, snap["unreal_pnl"]
 
 
 def _entry_prices(entries: list[dict]) -> list[float]:
@@ -215,9 +243,9 @@ def execute(toss: TossClient, risk: RiskManager, cfg: Config, d: Decision, price
         log.warning("• %s %s x%d 거부: %s", d.symbol, d.action, d.quantity, why)
         return "REJECT_RISK"
 
-    # 매도는 보유 수량 검증
+    # 매도는 보유 수량 검증 (컨텍스트와 동일 기준: DRY_RUN=페이퍼, 실거래=실계좌)
     if d.action == "SELL":
-        sellable = toss.sellable_quantity(d.symbol)
+        sellable = paper.position_qty(d.symbol) if cfg.dry_run else toss.sellable_quantity(d.symbol)
         if d.quantity > sellable:
             log.warning("• %s SELL x%d 거부: 매도가능 %s주", d.symbol, d.quantity, sellable)
             return "SKIP_NOT_SELLABLE"
@@ -288,8 +316,12 @@ def resolve_universe(toss: TossClient, cfg: Config, screener) -> tuple[list[str]
 
     동적 모드면 그날 universe(캐시) ∪ 보유종목, 아니면 고정 TRADE_SYMBOLS ∪ 보유종목.
     보유종목을 항상 포함해 보유분 매도(SELL) 길을 열어둔다.
+    보유종목은 컨텍스트와 동일하게 DRY_RUN 이면 페이퍼, 실거래면 실계좌 기준.
     """
-    held = [it.get("symbol") for it in (toss.holdings().get("items") or []) if it.get("symbol")]
+    if cfg.dry_run:
+        held = paper.position_symbols()
+    else:
+        held = [it.get("symbol") for it in (toss.holdings().get("items") or []) if it.get("symbol")]
     if cfg.dynamic_universe and screener is not None:
         universe = screener.select(toss)
         base = [u["symbol"] for u in universe]

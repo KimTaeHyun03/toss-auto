@@ -135,6 +135,19 @@ def position_symbols() -> list[str]:
         return []
 
 
+def position_qty(symbol: str) -> float:
+    """현재 페이퍼 보유 수량(매도 검증용). 없으면 0."""
+    if not db.enabled():
+        return 0.0
+    try:
+        with db._connect() as c, c.cursor() as cur:
+            cur.execute("SELECT qty FROM paper_positions WHERE symbol=%s", (symbol,))
+            row = cur.fetchone()
+            return float(row[0]) if row else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def snapshot(prices: dict) -> dict | None:
     """현재 페이퍼 포트폴리오 상태(대시보드용). prices: {symbol: 현재가}."""
     if not db.enabled():
